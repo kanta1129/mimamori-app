@@ -71,3 +71,16 @@ export default defineConfig([
   },
 ])
 ```
+
+# 立ち上げ方
+## コマンド
+~~~
+npm create vite@latest mimamori-app
+npm run dev
+~~~
+
+ブランチを確実にmainにする方法
+
+~~~
+git branch -M main
+~~~
