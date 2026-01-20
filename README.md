@@ -84,3 +84,10 @@ npm run dev
 ~~~
 git branch -M main
 ~~~
+
+# TeachableMachineの導入方法
+## npm install
+
+~~~
+npm install @teachablemachine/pose @tensorflow/tfjs
+~~~

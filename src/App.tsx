@@ -1,36 +1,94 @@
 import { useEffect, useRef, useState } from 'react';
-import { Pose, Results, POSE_CONNECTIONS, NormalizedLandmarkList } from '@mediapipe/pose';
+import { Pose, Results, POSE_CONNECTIONS } from '@mediapipe/pose';
 import { Camera } from '@mediapipe/camera_utils';
 import { drawConnectors, drawLandmarks } from '@mediapipe/drawing_utils';
+// ★ Teachable Machineのライブラリをインポート
+import * as tmPose from '@teachablemachine/pose';
 
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   
-  // 画面に表示するステータス
-  const [status, setStatus] = useState<string>('モニタリング中... 🟢');
+  // ★ モデルを保持するState
+  const [model, setModel] = useState<tmPose.CustomPoseNet | null>(null);
 
-  // 姿勢データをローカルで処理する関数
-  // ここに「転倒検知」や「長時間静止」などのロジックを書きます
-  const analyzePose = (landmarks: NormalizedLandmarkList) => {
-    // 例: 鼻(0番)のY座標を取得 (0が上，1が下)
-    const noseY = landmarks[0].y;
+  const [status, setStatus] = useState<string>('モデル読み込み中... ⏳');
+  const [debugInfo, setDebugInfo] = useState<string>('');
+  const [isFallDetected, setIsFallDetected] = useState<boolean>(false);
 
-    // 簡易的な判定ロジックの例
-    // 鼻の位置が極端に低い場合（床に近い場合）
-    if (noseY > 0.8) {
-      setStatus('⚠️ 転倒の可能性あり (床に近い)');
-      // ここで警告音を鳴らすなどの処理も可能です
-    } else {
-      setStatus('モニタリング中... 🟢');
-    }
+  // ----------------------------------------------------------------
+  // ★ 1. モデルのロード処理
+  // ----------------------------------------------------------------
+  useEffect(() => {
+    const loadModel = async () => {
+      // publicフォルダに配置したパスを指定
+      const modelURL = "./my-pose-model/model.json";
+      const metadataURL = "./my-pose-model/metadata.json";
+
+      try {
+        // Teachable Machineのモデルをロード
+        const loadedModel = await tmPose.load(modelURL, metadataURL);
+        setModel(loadedModel);
+        setStatus('モニタリング準備完了 🟢');
+        console.log("Model Loaded!");
+      } catch (error) {
+        console.error("モデルの読み込みに失敗しました:", error);
+        setStatus('❌ モデル読み込みエラー');
+      }
+    };
+
+    loadModel();
+  }, []);
+
+  // ----------------------------------------------------------------
+  // ★ 2. AIによる推論処理
+  // ----------------------------------------------------------------
+  const predict = async () => {
+    if (!model || !videoRef.current) return;
+
+    // Teachable Machineで推論を実行
+    // estimatePoseは { pose: ..., posenetOutput: ... } を返すが、
+    // ここでは predict メソッドを使ってクラス確率を取得する
+    const { prediction } = await model.estimatePose(videoRef.current);
+
+    // prediction は [{ className: "Standing", probability: 0.99 }, ...] の配列
     
-    // 開発用ログ（必要に応じてコメントアウト解除）
-    // console.log("Nose Y:", noseY);
+    // 最も確率が高いクラスを探す
+    let highestProb = 0;
+    let bestClass = "";
+
+    prediction.forEach((p) => {
+      if (p.probability > highestProb) {
+        highestProb = p.probability;
+        bestClass = p.className;
+      }
+    });
+
+    // デバッグ表示: 全クラスの確率を表示
+    const debugText = prediction
+      .map(p => `${p.className}: ${(p.probability * 100).toFixed(1)}%`)
+      .join(' / ');
+    setDebugInfo(debugText);
+
+    // ★ 判定ロジック (クラス名はTeachableMachineで設定したものに合わせてください)
+    // 例: "Fall", "Standing", "Sitting" など
+    if (bestClass === "Fall" && highestProb > 0.85) { // 85%以上の確信度で転倒
+      setStatus('⚠️ 転倒検知 (AI判定)');
+      setIsFallDetected(true);
+      // ここでサーバー送信処理などを呼ぶ
+    } else {
+      setStatus(`モニタリング中: ${bestClass}`);
+      setIsFallDetected(false);
+    }
   };
 
+  // ----------------------------------------------------------------
+  // MediaPipeの設定 (描画用)
+  // Teachable Machineにも姿勢検知は入っていますが、
+  // MediaPipeの方が描画が綺麗なので、可視化用として残します。
+  // ※重い場合はMediaPipeを削除してTMの描画機能だけ使うことも可能です。
+  // ----------------------------------------------------------------
   useEffect(() => {
-    // 1. MediaPipe Poseの初期化
     const pose = new Pose({
       locateFile: (file) => {
         return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
@@ -45,45 +103,55 @@ function App() {
       minTrackingConfidence: 0.5,
     });
 
-    // 2. 推論結果が返ってきたときの処理
     pose.onResults((results: Results) => {
-      // (A) キャンバスへの描画（映像と骨格）
-      if (canvasRef.current && videoRef.current) {
-        const canvasCtx = canvasRef.current.getContext('2d');
-        if (canvasCtx) {
-          canvasCtx.save();
-          canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-          
-          // カメラ映像を描画
-          canvasCtx.drawImage(
-            results.image, 0, 0, canvasRef.current.width, canvasRef.current.height
-          );
+      if (!canvasRef.current || !videoRef.current) return;
+      const canvasCtx = canvasRef.current.getContext('2d');
+      if (!canvasCtx) return;
 
-          // 骨格を描画
-          if (results.poseLandmarks) {
-            drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, {
-              color: '#00FF00',
-              lineWidth: 4,
-            });
-            drawLandmarks(canvasCtx, results.poseLandmarks, {
-              color: '#FF0000',
-              lineWidth: 2,
-            });
+      const canvasWidth = canvasRef.current.width;
+      const canvasHeight = canvasRef.current.height;
 
-            // (B) ローカルでのデータ解析処理を実行
-            analyzePose(results.poseLandmarks);
-          }
-          canvasCtx.restore();
-        }
+      // 描画
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+      
+      // 映像を描画
+      canvasCtx.drawImage(results.image, 0, 0, canvasWidth, canvasHeight);
+
+      // 骨格を描画
+      if (results.poseLandmarks) {
+        drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, {
+          color: '#00FF00',
+          lineWidth: 4,
+        });
+        drawLandmarks(canvasCtx, results.poseLandmarks, {
+          color: '#FF0000',
+          lineWidth: 2,
+        });
       }
+      
+      // 転倒時は画面全体を赤枠で囲むエフェクト
+      if (isFallDetected) {
+        canvasCtx.strokeStyle = 'red';
+        canvasCtx.lineWidth = 10;
+        canvasCtx.strokeRect(0, 0, canvasWidth, canvasHeight);
+      }
+
+      canvasCtx.restore();
     });
 
-    // 3. カメラのセットアップと開始
     if (videoRef.current) {
       const camera = new Camera(videoRef.current, {
         onFrame: async () => {
           if (videoRef.current) {
+            // 1. MediaPipeへ映像を送る (描画用)
             await pose.send({ image: videoRef.current });
+            
+            // ★ 2. Teachable Machineで推論する (判定用)
+            // モデルのロードが完了していれば実行
+            if (model) {
+              await predict();
+            }
           }
         },
         width: 1280,
@@ -91,32 +159,30 @@ function App() {
       });
       camera.start();
     }
-  }, []);
+  }, [model, isFallDetected]); // modelやstateが変わった時に最新の状態を参照できるように依存配列に追加
 
   return (
-    <div style={{ textAlign: 'center', padding: '20px' }}>
-      <h1>高齢者見守りシステム (ローカル版)</h1>
+    <div style={{ textAlign: 'center', padding: '20px', fontFamily: 'sans-serif' }}>
+      <h1>高齢者見守りシステム (AIモデル判定版)</h1>
       
-      {/* 判定結果の表示エリア */}
+      {/* ステータス表示パネル */}
       <div style={{ 
-        fontSize: '24px', 
-        fontWeight: 'bold', 
-        margin: '20px 0',
-        color: status.includes('⚠️') ? 'red' : 'green' 
+        margin: '0 auto 20px',
+        padding: '15px',
+        maxWidth: '800px',
+        backgroundColor: status.includes('転倒') ? '#ffcdd2' : '#e8f5e9',
+        border: `3px solid ${status.includes('転倒') ? 'red' : 'green'}`,
+        borderRadius: '10px',
       }}>
-        現在の状態: {status}
+        <h2 style={{ margin: 0, color: '#333' }}>{status}</h2>
+        <p style={{ margin: '10px 0 0', fontSize: '14px', color: '#666', fontFamily: 'monospace' }}>
+          AI確信度: {debugInfo}
+        </p>
       </div>
 
+      {/* 映像エリア */}
       <div style={{ position: 'relative', display: 'inline-block' }}>
-        {/* MediaPipeの入力用ビデオ（非表示） */}
-        <video
-          ref={videoRef}
-          style={{ display: 'none' }}
-          autoPlay
-          playsInline
-        ></video>
-
-        {/* 結果描画用キャンバス */}
+        <video ref={videoRef} style={{ display: 'none' }} autoPlay playsInline></video>
         <canvas
           ref={canvasRef}
           width={1280}
