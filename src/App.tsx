@@ -1,202 +1,273 @@
-import { useEffect, useRef, useState } from 'react';
-import { Pose, Results, POSE_CONNECTIONS } from '@mediapipe/pose';
-import { Camera } from '@mediapipe/camera_utils';
-import { drawConnectors, drawLandmarks } from '@mediapipe/drawing_utils';
-// ★ Teachable Machineのライブラリをインポート
+import React, { useEffect, useRef, useState } from 'react';
 import * as tmPose from '@teachablemachine/pose';
+import emailjs from '@emailjs/browser';
 
-function App() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+// ==============================================================================
+// ★設定エリア：ここを必ず書き換えてください！
+// ==============================================================================
+const SERVICE_ID = "service_n47ntzj";
+const TEMPLATE_ID = "template_xghdcus";
+const PUBLIC_KEY = "_46k8h5ZReUK5kurp";   
+
+// ==============================================================================
+// その他の設定
+// ==============================================================================
+const COOLDOWN_TIME = 600000; // 1分間は再送しない (テスト用)
+const CAMERA_WIDTH = 400;
+const CAMERA_HEIGHT = 400;
+
+const App = () => {
+  // ----------------------------------------------------------------------------
+  // ステート管理
+  // ----------------------------------------------------------------------------
+  const [targetEmail, setTargetEmail] = useState(() => localStorage.getItem('targetEmail') || '');
+  const [isSettingsMode, setIsSettingsMode] = useState(!localStorage.getItem('targetEmail'));
   
-  // ★ モデルを保持するState
-  const [model, setModel] = useState<tmPose.CustomPoseNet | null>(null);
+  const [status, setStatus] = useState("システム起動中... ⏳");
+  const [currentClass, setCurrentClass] = useState("---"); 
+  const [probability, setProbability] = useState(0);       
+  const [isAlert, setIsAlert] = useState(false);           
 
-  const [status, setStatus] = useState<string>('モデル読み込み中... ⏳');
-  const [debugInfo, setDebugInfo] = useState<string>('');
-  const [isFallDetected, setIsFallDetected] = useState<boolean>(false);
+  // 内部変数
+  const webcamRef = useRef<tmPose.Webcam | null>(null);
+  const modelRef = useRef<tmPose.CustomPoseNet | null>(null);
+  const requestRef = useRef<number>(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  
+  // ★重要: 送信時間の管理 (localStorageと同期)
+  const lastSentTimeRef = useRef(parseInt(localStorage.getItem('lastSentTime') || '0', 10));
 
-  // ----------------------------------------------------------------
-  // ★ 1. モデルのロード処理
-  // ----------------------------------------------------------------
+  const [inputEmail, setInputEmail] = useState(targetEmail);
+
+  // ----------------------------------------------------------------------------
+  // 初期化処理
+  // ----------------------------------------------------------------------------
   useEffect(() => {
-    const loadModel = async () => {
-      // publicフォルダに配置したパスを指定
-      const modelURL = "./my-pose-model/model.json";
-      const metadataURL = "./my-pose-model/metadata.json";
+    if (isSettingsMode) return;
 
+    let isMounted = true;
+
+    const init = async () => {
       try {
-        // Teachable Machineのモデルをロード
-        const loadedModel = await tmPose.load(modelURL, metadataURL);
-        setModel(loadedModel);
-        setStatus('モニタリング準備完了 🟢');
-        console.log("Model Loaded!");
+        const modelURL = "./my-pose-model/model.json";
+        const metadataURL = "./my-pose-model/metadata.json";
+
+        const model = await tmPose.load(modelURL, metadataURL);
+        if (!isMounted) return;
+        modelRef.current = model;
+        
+        setStatus("カメラ起動中...");
+
+        const flip = true; 
+        const webcam = new tmPose.Webcam(CAMERA_WIDTH, CAMERA_HEIGHT, flip);
+        await webcam.setup(); 
+        
+        if (!isMounted) return;
+        await webcam.play();
+        webcamRef.current = webcam;
+
+        if (containerRef.current) {
+            containerRef.current.innerHTML = '';
+            const canvas = webcam.canvas;
+            canvas.style.width = "100%";
+            canvas.style.height = "100%";
+            canvas.style.objectFit = "cover";
+            containerRef.current.appendChild(canvas);
+        }
+
+        setStatus("監視中 🟢");
+        requestRef.current = window.requestAnimationFrame(loop);
+
       } catch (error) {
-        console.error("モデルの読み込みに失敗しました:", error);
-        setStatus('❌ モデル読み込みエラー');
+        console.error(error);
+        if (isMounted) setStatus("❌ エラー: カメラ等の読み込み失敗");
       }
     };
 
-    loadModel();
-  }, []);
+    init();
 
-  // ----------------------------------------------------------------
-  // ★ 2. AIによる推論処理
-  // ----------------------------------------------------------------
+    return () => {
+      isMounted = false;
+      if (requestRef.current) window.cancelAnimationFrame(requestRef.current);
+      if (webcamRef.current) webcamRef.current.stop();
+    };
+  }, [isSettingsMode]);
+
+  // ----------------------------------------------------------------------------
+  // ループ & 推論
+  // ----------------------------------------------------------------------------
+  const loop = async () => {
+    if (!webcamRef.current || !modelRef.current || isSettingsMode) return;
+    webcamRef.current.update();
+    await predict();
+    requestRef.current = window.requestAnimationFrame(loop);
+  };
+
   const predict = async () => {
-    if (!model || !videoRef.current) return;
-
-    // Teachable Machineで推論を実行
-    // estimatePoseは { pose: ..., posenetOutput: ... } を返すが、
-    // ここでは predict メソッドを使ってクラス確率を取得する
-    const { prediction } = await model.estimatePose(videoRef.current);
-
-    // prediction は [{ className: "Standing", probability: 0.99 }, ...] の配列
+    if (!webcamRef.current || !modelRef.current) return;
     
-    // 最も確率が高いクラスを探す
+    const { posenetOutput } = await modelRef.current.estimatePose(webcamRef.current.canvas);
+    const prediction = await modelRef.current.predict(posenetOutput);
+
     let highestProb = 0;
-    let bestClass = "";
-
-    prediction.forEach((p) => {
-      if (p.probability > highestProb) {
-        highestProb = p.probability;
-        bestClass = p.className;
+    let bestClassName = "";
+    
+    for (let i = 0; i < prediction.length; i++) {
+      if (prediction[i].probability > highestProb) {
+        highestProb = prediction[i].probability;
+        bestClassName = prediction[i].className;
       }
-    });
+    }
 
-    // デバッグ表示: 全クラスの確率を表示
-    const debugText = prediction
-      .map(p => `${p.className}: ${(p.probability * 100).toFixed(1)}%`)
-      .join(' / ');
-    setDebugInfo(debugText);
+    setCurrentClass(bestClassName);
+    const probPercent = Math.round(highestProb * 100);
+    setProbability(probPercent);
 
-    // ★ 判定ロジック (クラス名はTeachableMachineで設定したものに合わせてください)
-    // 例: "Fall", "Standing", "Sitting" など
-    if (bestClass === "Fall" && highestProb > 0.85) { // 85%以上の確信度で転倒
-      setStatus('⚠️ 転倒検知 (AI判定)');
-      setIsFallDetected(true);
-      // ここでサーバー送信処理などを呼ぶ
+    if (bestClassName === "Fall" || bestClassName === "転倒" || bestClassName === "倒れている") {
+      setIsAlert(true);
+      checkAndSendEmail(probPercent);
     } else {
-      setStatus(`モニタリング中: ${bestClass}`);
-      setIsFallDetected(false);
+      setIsAlert(false);
     }
   };
 
-  // ----------------------------------------------------------------
-  // MediaPipeの設定 (描画用)
-  // Teachable Machineにも姿勢検知は入っていますが、
-  // MediaPipeの方が描画が綺麗なので、可視化用として残します。
-  // ※重い場合はMediaPipeを削除してTMの描画機能だけ使うことも可能です。
-  // ----------------------------------------------------------------
-  useEffect(() => {
-    const pose = new Pose({
-      locateFile: (file) => {
-        return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
-      },
-    });
+  // ----------------------------------------------------------------------------
+  // メール送信機能 (デバッグ強化版)
+  // ----------------------------------------------------------------------------
+  const checkAndSendEmail = (confidence: number) => {
+    const now = Date.now();
+    
+    // ★改良: ループ内では localStorage から直接メールアドレスを読み取る (確実性アップ)
+    const currentEmail = localStorage.getItem('targetEmail');
 
-    pose.setOptions({
-      modelComplexity: 1,
-      smoothLandmarks: true,
-      enableSegmentation: false,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence: 0.5,
-    });
+    // 1. 確信度が低いなら無視
+    if (confidence <= 90) return;
 
-    pose.onResults((results: Results) => {
-      if (!canvasRef.current || !videoRef.current) return;
-      const canvasCtx = canvasRef.current.getContext('2d');
-      if (!canvasCtx) return;
-
-      const canvasWidth = canvasRef.current.width;
-      const canvasHeight = canvasRef.current.height;
-
-      // 描画
-      canvasCtx.save();
-      canvasCtx.clearRect(0, 0, canvasWidth, canvasHeight);
-      
-      // 映像を描画
-      canvasCtx.drawImage(results.image, 0, 0, canvasWidth, canvasHeight);
-
-      // 骨格を描画
-      if (results.poseLandmarks) {
-        drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, {
-          color: '#00FF00',
-          lineWidth: 4,
-        });
-        drawLandmarks(canvasCtx, results.poseLandmarks, {
-          color: '#FF0000',
-          lineWidth: 2,
-        });
-      }
-      
-      // 転倒時は画面全体を赤枠で囲むエフェクト
-      if (isFallDetected) {
-        canvasCtx.strokeStyle = 'red';
-        canvasCtx.lineWidth = 10;
-        canvasCtx.strokeRect(0, 0, canvasWidth, canvasHeight);
-      }
-
-      canvasCtx.restore();
-    });
-
-    if (videoRef.current) {
-      const camera = new Camera(videoRef.current, {
-        onFrame: async () => {
-          if (videoRef.current) {
-            // 1. MediaPipeへ映像を送る (描画用)
-            await pose.send({ image: videoRef.current });
-            
-            // ★ 2. Teachable Machineで推論する (判定用)
-            // モデルのロードが完了していれば実行
-            if (model) {
-              await predict();
-            }
-          }
-        },
-        width: 1280,
-        height: 720,
-      });
-      camera.start();
+    // 2. メールアドレス未設定ならログを出して終了
+    if (!currentEmail) {
+      console.warn("⚠️ メールアドレスが設定されていません");
+      return;
     }
-  }, [model, isFallDetected]); // modelやstateが変わった時に最新の状態を参照できるように依存配列に追加
+
+    // 3. クールダウン時間のチェック
+    if (now - lastSentTimeRef.current <= COOLDOWN_TIME) {
+      // 頻繁に出すぎると見づらいのでログは出さないか、必要なら以下をコメントアウト解除
+      // console.log(`⏳ クールダウン中... あと ${Math.round((COOLDOWN_TIME - (now - lastSentTimeRef.current))/1000)} 秒`);
+      return;
+    }
+      
+    // --- ここから送信処理 ---
+    console.log(`📩 送信条件クリア！ ${currentEmail} に送信を試みます...`);
+
+    // 即座にロック
+    lastSentTimeRef.current = now;
+    localStorage.setItem('lastSentTime', now.toString());
+
+    const templateParams = {
+      to_name: "保護者様",
+      user_email: currentEmail, // テンプレート側を {{user_email}} に変更している必要があります
+      probability: confidence,
+      time: new Date().toLocaleTimeString(),
+    };
+
+    emailjs.send(SERVICE_ID, TEMPLATE_ID, templateParams, PUBLIC_KEY)
+      .then((response) => {
+          console.log('✅ 送信成功!', response.status, response.text);
+          setStatus("📩 メール通知を送信しました！");
+          setTimeout(() => setStatus("監視中 🟢"), 3000);
+      }, (err) => {
+          console.error('❌ 送信失敗:', err);
+          if (err.status === 429) setStatus("⚠️ 送信制限中 (しばらくお待ちください)");
+          else setStatus("❌ 送信エラー: ID設定などを確認してください");
+      });
+  };
+
+  const handleSaveSettings = () => {
+    if (!inputEmail.includes("@")) {
+      alert("正しいメールアドレスを入力してください");
+      return;
+    }
+    setTargetEmail(inputEmail);
+    localStorage.setItem('targetEmail', inputEmail);
+    setIsSettingsMode(false);
+    setStatus("設定を保存しました。カメラを起動します...");
+  };
+
+  // ----------------------------------------------------------------------------
+  // UI 描画
+  // ----------------------------------------------------------------------------
+  if (isSettingsMode) {
+    return (
+      <div style={{ 
+        width: '100vw', height: '100vh', backgroundColor: '#f0f2f5',
+        display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center',
+        fontFamily: 'Arial, sans-serif'
+      }}>
+        <div style={{ 
+          padding: '30px', backgroundColor: 'white', borderRadius: '15px',
+          boxShadow: '0 4px 15px rgba(0,0,0,0.1)', width: '90%', maxWidth: '400px', textAlign: 'center'
+        }}>
+          <h2>📧 初期設定</h2>
+          <p style={{ color: '#666', marginBottom: '20px' }}>緊急時の通知先メールアドレスを<br/>入力してください。</p>
+          <input 
+            type="email" placeholder="example@gmail.com" value={inputEmail}
+            onChange={(e) => setInputEmail(e.target.value)}
+            style={{ 
+              width: '100%', padding: '12px', fontSize: '16px', borderRadius: '8px',
+              border: '1px solid #ccc', marginBottom: '20px', boxSizing: 'border-box'
+            }}
+          />
+          <button onClick={handleSaveSettings} style={{ 
+            width: '100%', padding: '12px', fontSize: '16px', fontWeight: 'bold',
+            backgroundColor: '#4CAF50', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer'
+          }}>設定を保存して開始</button>
+          {targetEmail && (
+            <button onClick={() => setIsSettingsMode(false)} style={{ 
+              marginTop: '10px', background: 'none', border: 'none', color: '#666', cursor: 'pointer', textDecoration: 'underline'
+            }}>キャンセル</button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div style={{ textAlign: 'center', padding: '20px', fontFamily: 'sans-serif' }}>
-      <h1>高齢者見守りシステム (AIモデル判定版)</h1>
+    <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden', backgroundColor: '#000', fontFamily: 'Arial, sans-serif' }}>
+      <div ref={containerRef} style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: 1 }}></div>
       
-      {/* ステータス表示パネル */}
-      <div style={{ 
-        margin: '0 auto 20px',
-        padding: '15px',
-        maxWidth: '800px',
-        backgroundColor: status.includes('転倒') ? '#ffcdd2' : '#e8f5e9',
-        border: `3px solid ${status.includes('転倒') ? 'red' : 'green'}`,
-        borderRadius: '10px',
-      }}>
-        <h2 style={{ margin: 0, color: '#333' }}>{status}</h2>
-        <p style={{ margin: '10px 0 0', fontSize: '14px', color: '#666', fontFamily: 'monospace' }}>
-          AI確信度: {debugInfo}
-        </p>
-      </div>
+      <button onClick={() => setIsSettingsMode(true)} style={{
+        position: 'absolute', top: '15px', right: '15px', zIndex: 20,
+        backgroundColor: 'rgba(0,0,0,0.5)', color: 'white', border: 'none',
+        padding: '8px 12px', borderRadius: '20px', cursor: 'pointer', fontSize: '12px'
+      }}>⚙️ 設定変更</button>
 
-      {/* 映像エリア */}
-      <div style={{ position: 'relative', display: 'inline-block' }}>
-        <video ref={videoRef} style={{ display: 'none' }} autoPlay playsInline></video>
-        <canvas
-          ref={canvasRef}
-          width={1280}
-          height={720}
-          style={{
-            width: '100%',
-            maxWidth: '800px',
-            border: '2px solid #333',
-            borderRadius: '8px'
-          }}
-        ></canvas>
+      <div style={{ position: 'absolute', top: '20px', left: '50%', transform: 'translateX(-50%)', width: '90%', maxWidth: '400px', zIndex: 10, textAlign: 'center' }}>
+        <div style={{ 
+          padding: '15px 20px',
+          backgroundColor: isAlert ? 'rgba(255, 235, 238, 0.9)' : 'rgba(255, 255, 255, 0.85)',
+          border: `4px solid ${isAlert ? '#f44336' : '#4caf50'}`,
+          borderRadius: '20px',
+          boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)',
+          backdropFilter: 'blur(5px)',
+          transition: 'all 0.3s ease'
+        }}>
+          <h2 style={{ margin: '0', fontSize: '1.5rem', color: '#333' }}>
+            状態: <span style={{ color: isAlert ? '#d32f2f' : '#2e7d32', fontWeight: 'bold' }}>{currentClass}</span>
+          </h2>
+          <div style={{ marginTop: '5px', fontSize: '1rem', color: '#555' }}>
+            確信度: <strong>{probability}%</strong>
+          </div>
+          {isAlert && (
+            <div style={{ marginTop: '10px', color: '#d32f2f', fontWeight: 'bold', fontSize: '1.1rem', animation: 'blink 0.5s infinite' }}>
+              ⚠️ 転倒検知！<br/>保護者に通知します
+            </div>
+          )}
+        </div>
+        <div style={{ marginTop: '10px', color: 'rgba(255,255,255,0.8)', textShadow: '0 1px 2px rgba(0,0,0,0.8)', fontSize: '0.8rem' }}>{status}</div>
       </div>
+      <style>{`@keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }`}</style>
     </div>
   );
-}
+};
 
 export default App;
