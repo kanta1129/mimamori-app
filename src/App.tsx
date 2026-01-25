@@ -185,6 +185,7 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
     };
     init();
 
+    // クリーンアップ
     return () => {
         isMounted = false;
         if (loopRef.current) cancelAnimationFrame(loopRef.current);
@@ -249,34 +250,33 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
 };
 
 // ==============================================================================
-// 【モニターモード】(画面幅拡大 & 設定クラウド同期版)
+// 【モニターモード】 (直接参照・完全版)
 // ==============================================================================
 const MonitorMode = ({ familyId, onBack }: { familyId: string, onBack: () => void }) => {
   const [cameras, setCameras] = useState<any>({});
   const [log, setLog] = useState<string[]>([]);
   const lastSentTimeRef = useRef(0);
   
-  // メール設定 (初期値は空)
+  // 表示用・編集用の状態
   const [targetEmail, setTargetEmail] = useState('');
   const [emailInput, setEmailInput] = useState('');
 
   useEffect(() => {
-    // 家族のデータ全体を監視 (カメラも設定も含む)
     const familyRef = ref(db, `families/${familyId}`);
     
     const unsubscribe = onValue(familyRef, (snapshot) => {
       const data = snapshot.val();
       if (data) {
-        // 1. 設定データを取り出す
-        if (data.settings && data.settings.email) {
-            setTargetEmail(data.settings.email);
-            // 入力欄も同期 (編集中でなければ)
-            if (document.activeElement?.tagName !== "INPUT") {
-                setEmailInput(data.settings.email);
-            }
+        // 1. Firebaseにある「最新のメアド」を取り出す
+        const firebaseEmail = data.settings?.email || "";
+
+        // (画面表示用) 状態を更新
+        setTargetEmail(firebaseEmail);
+        if (document.activeElement?.tagName !== "INPUT") {
+            setEmailInput(firebaseEmail);
         }
 
-        // 2. カメラデータを取り出す (settings以外)
+        // 2. カメラデータを分離
         const cameraData: any = {};
         Object.keys(data).forEach(key => {
             if (key !== 'settings') {
@@ -285,7 +285,9 @@ const MonitorMode = ({ familyId, onBack }: { familyId: string, onBack: () => voi
         });
 
         setCameras(cameraData);
-        checkAlert(cameraData, data.settings?.email);
+
+        // ★重要: ここで「Firebaseから取れたてのメアド」を渡してチェックする
+        checkAlert(cameraData, firebaseEmail);
       } else {
         setCameras({});
       }
@@ -294,6 +296,7 @@ const MonitorMode = ({ familyId, onBack }: { familyId: string, onBack: () => voi
     return () => unsubscribe();
   }, [familyId]);
 
+  // アラート判定関数
   const checkAlert = (cameraData: any, currentEmail: string) => {
     const now = Date.now();
     let anyFall = false;
@@ -306,30 +309,31 @@ const MonitorMode = ({ familyId, onBack }: { familyId: string, onBack: () => voi
       }
     });
 
-    // DBから取得した最新のメールアドレスを使用
+    // 引数(currentEmail)を使って送信判断
     if (anyFall && currentEmail && (now - lastSentTimeRef.current > 60000)) {
-      sendEmail(fallDevice, currentEmail);
+      sendEmail(fallDevice, currentEmail); 
       lastSentTimeRef.current = now;
     }
   };
 
+  // メール送信関数 (宛先を引数で受け取る)
   const sendEmail = (deviceId: string, toEmail: string) => {
     const msg = `🚨 警告: カメラ[${deviceId}]で転倒を検知しました！`;
     setLog(prev => [new Date().toLocaleTimeString() + " " + msg, ...prev]);
 
     const templateParams = {
         to_name: "管理者様",
-        user_email: toEmail, // 同期されたメアドに送信
+        user_email: toEmail, // ← 引数のメアドを使う
         probability: "100", 
         time: new Date().toLocaleTimeString() + ` (Device: ${deviceId})`
     };
 
     emailjs.send(SERVICE_ID, TEMPLATE_ID, templateParams, PUBLIC_KEY)
-      .then(() => console.log("Sent"))
+      .then(() => console.log("Sent to " + toEmail))
       .catch(err => console.error(err));
   };
 
-  // クラウド(Firebase)に設定を保存する
+  // 設定保存関数
   const saveEmail = () => {
       set(ref(db, `families/${familyId}/settings`), {
           email: emailInput
@@ -353,7 +357,7 @@ const MonitorMode = ({ familyId, onBack }: { familyId: string, onBack: () => voi
         現在監視中のグループID: <strong style={{fontSize: '1.2em', marginLeft: '5px'}}>{familyId}</strong>
       </div>
       
-      {/* メール設定エリア (クラウド同期) */}
+      {/* メール設定エリア */}
       <div style={{ marginBottom: '20px', padding: '20px', background: '#fff', borderRadius: '10px', boxShadow: '0 2px 8px rgba(0,0,0,0.05)' }}>
         <h3 style={{marginTop: 0, fontSize: '1.1em', color: '#444'}}>📩 通知先設定 (グループ共有)</h3>
         <div style={{display: 'flex', gap: '10px', flexWrap: 'wrap'}}>
@@ -366,7 +370,7 @@ const MonitorMode = ({ familyId, onBack }: { familyId: string, onBack: () => voi
             </button>
         </div>
         <div style={{marginTop: '10px', fontSize: '0.9em', color: '#666'}}>
-            現在の設定: <b>{targetEmail || "（未設定 - 保存すると全員に反映されます）"}</b>
+            現在の設定（DB参照）: <b>{targetEmail || "（未設定）"}</b>
         </div>
       </div>
 
