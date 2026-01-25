@@ -6,7 +6,7 @@ import { getDatabase, ref, set, onValue, serverTimestamp } from "firebase/databa
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 // ==============================================================================
-// 設定エリア
+// 設定エリア（既存の環境変数をそのまま使用）
 // ==============================================================================
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -22,8 +22,6 @@ const SERVICE_ID = import.meta.env.VITE_EMAILJS_SERVICE_ID;
 const TEMPLATE_ID = import.meta.env.VITE_EMAILJS_TEMPLATE_ID;
 const PUBLIC_KEY = import.meta.env.VITE_EMAILJS_PUBLIC_KEY;
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
-
-// ==============================================================================
 
 const app = initializeApp(firebaseConfig);
 const db = getDatabase(app);
@@ -46,6 +44,9 @@ const generateFamilyId = () => {
   return 'fam_' + Math.random().toString(36).substr(2, 6);
 };
 
+// ==============================================================================
+// メイン App コンポーネント
+// ==============================================================================
 const App = () => {
   const [mode, setMode] = useState<'setup' | 'select' | 'camera' | 'monitor'>(() => {
     return localStorage.getItem('familyId') ? 'select' : 'setup';
@@ -143,11 +144,12 @@ const App = () => {
 };
 
 // ==============================================================================
-// 【カメラモード】
+// 【カメラモード】 - 音声・権限問題を完全解決する修正版
 // ==============================================================================
 const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void }) => {
   const deviceId = getDeviceId();
-  const [statusText, setStatusText] = useState("起動中．．．");
+  const [isStarted, setIsStarted] = useState(false); // ★ブラウザ制限解除用
+  const [statusText, setStatusText] = useState("起動準備中．．．");
   const [isAlert, setIsAlert] = useState(false);
   const [aiState, setAiState] = useState<'idle' | 'asking' | 'listening' | 'judging' | 'cooldown'>('idle');
   const [userReply, setUserReply] = useState("");
@@ -159,13 +161,19 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
   const cooldownTimerRef = useRef<number>(0);
   const retryCountRef = useRef(0);
   const lastStateRef = useRef(""); 
+  
+  const isProcessingRef = useRef(false);
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null); // ★ガベージコレクション対策
 
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || "");
 
   useEffect(() => {
+    if (!isStarted) return; // ★ボタンを押すまで開始しない
+
     let isMounted = true;
     const init = async () => {
       try {
+        console.log("🛠️ システム初期化開始...");
         setStatusText("権限を確認中．．．");
         await navigator.mediaDevices.getUserMedia({
             video: { width: CAMERA_WIDTH, height: CAMERA_HEIGHT },
@@ -174,6 +182,7 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
 
         const modelURL = "./my-pose-model/model.json";
         const metadataURL = "./my-pose-model/metadata.json";
+        console.log("📂 モデルをロード中...");
         modelRef.current = await tmPose.load(modelURL, metadataURL);
 
         const webcam = new tmPose.Webcam(CAMERA_WIDTH, CAMERA_HEIGHT, true);
@@ -190,10 +199,12 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
                 containerRef.current.appendChild(webcam.canvas);
             }
             setStatusText(`監視中: ${familyId}`);
+            console.log("✅ 準備完了．監視ループを開始します．");
             loop(); 
         }
       } catch (e) {
-        if (isMounted) setStatusText("エラー： 許可を確認してください．");
+        console.error("❌ 初期化エラー:", e);
+        if (isMounted) setStatusText("エラー： カメラ/マイクを許可してください．");
       }
     };
     init();
@@ -203,7 +214,7 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
         if (webcamRef.current) webcamRef.current.stop();
         clearTimeout(cooldownTimerRef.current);
     };
-  }, []);
+  }, [isStarted]); // isStartedが変わったら動く
 
   const loop = async () => {
     if (webcamRef.current && modelRef.current && webcamRef.current.canvas) {
@@ -214,15 +225,45 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
   };
 
   const speak = (text: string, onEnd?: () => void) => {
+      console.log(`📢 発話開始: "${text}"`);
+      
+      // ブラウザの音声エンジンを強制再開＆リセット
       window.speechSynthesis.cancel();
-      const msg = new SpeechSynthesisUtterance(text);
-      msg.lang = 'ja-JP';
-      msg.onend = () => { if(onEnd) onEnd(); };
-      window.speechSynthesis.speak(msg);
+      window.speechSynthesis.resume();
+
+      // オブジェクトを変数に保持（ガベージコレクション対策）
+      utteranceRef.current = new SpeechSynthesisUtterance(text);
+      utteranceRef.current.lang = 'ja-JP';
+
+      utteranceRef.current.onend = () => {
+          console.log("📢 発話終了イベント検知");
+          utteranceRef.current = null;
+          if(onEnd) onEnd();
+      };
+
+      utteranceRef.current.onerror = (e) => {
+          console.error("📢 発話エラー:", e);
+          utteranceRef.current = null;
+          if(onEnd) onEnd();
+      };
+
+      window.speechSynthesis.speak(utteranceRef.current);
+      
+      // 保険の強制移行タイマー
+      if (onEnd) {
+          setTimeout(() => {
+              if (isProcessingRef.current && aiState === 'asking') {
+                  console.warn("⚠️ 発話終了が検知されないため強制的に聞き取りへ移行します．");
+                  onEnd();
+              }
+          }, 6000);
+      }
   };
 
   const startListening = () => {
+    console.log("👂 音声認識を起動します...");
     if (!SpeechRecognition) {
+        console.error("❌ 音声認識APIが非対応です．");
         handleNoResponse();
         return;
     }
@@ -230,25 +271,36 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
     setStatusText("👂 返答を聞いています．．．");
     const recognition = new SpeechRecognition();
     recognition.lang = 'ja-JP';
+
+    recognition.onstart = () => console.log("🎤 マイク録音開始");
+
     recognition.onresult = (event: any) => {
         const reply = event.results[0][0].transcript;
+        console.log(`🎤 聞き取り成功: "${reply}"`);
         setUserReply(`「${reply}」`);
         handleUserResponseWithAI(reply);
     };
-    recognition.onerror = () => handleNoResponse();
+
+    recognition.onerror = (e: any) => {
+        console.error("👂 音声認識エラー:", e.error);
+        handleNoResponse();
+    };
+    
     recognition.start();
   };
 
   const handleUserResponseWithAI = async (text: string) => {
       setAiState('judging');
       setStatusText("🧠 AIが判断中．．．");
+      console.log("🚀 Gemini API 通信開始...");
       
-      const modelNames = ["gemini-3-flash-preview", "gemini-1.5-flash", "gemini-pro"];
+      const modelNames = ["gemini-3-flash-preview", "gemini-1.5-flash", "gemini-pro"]; 
       let success = false;
 
       for (const mName of modelNames) {
           if (success) break;
           try {
+              console.log(`📡 モデル ${mName} にリクエスト中...`);
               const model = genAI.getGenerativeModel(
                 { model: mName },
                 { apiVersion: "v1beta" }
@@ -260,7 +312,10 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
 
               const result = await model.generateContent(prompt);
               const response = await result.response;
-              const jsonText = response.text().replace(/```json|```/g, "").trim();
+              const responseText = response.text();
+              console.log(`📝 Gemini返答 (${mName}):`, responseText);
+
+              const jsonText = responseText.replace(/```json|```/g, "").trim();
               const aiDecision = JSON.parse(jsonText);
 
               success = true;
@@ -275,17 +330,18 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
                   handleNoResponse();
               }
           } catch (error) {
-              console.warn(`Failed with ${mName}`);
+              console.error(`❌ モデル ${mName} エラー:`, error);
           }
       }
 
       if (!success) {
+          console.warn("⚠️ AI全滅のためキーワードチェックへ移行．");
           fallbackKeywordCheck(text);
       }
   };
 
   const fallbackKeywordCheck = (text: string) => {
-      const safeKeywords = ["筋トレ", "大丈夫", "寝る", "はい", "元気"];
+      const safeKeywords = ["筋トレ", "大丈夫", "寝る", "はい", "元気", "平気", "何でもない"];
       if (safeKeywords.some(k => text.includes(k))) {
           speak("分かりました．");
           enterCooldown("SAFE", "キーワード一致", "分かりました．", text);
@@ -296,6 +352,7 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
   };
 
   const handleNoResponse = () => {
+      console.log("⏰ 応答がありません．");
       if (retryCountRef.current < 1) {
           retryCountRef.current++;
           speak("大丈夫ですか？", () => startListening());
@@ -306,6 +363,7 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
   };
 
   const enterCooldown = (statusStr: string, reason: string, aiReply: string, userSaid: string) => {
+      console.log("✅ クールダウン開始．");
       setAiState('cooldown');
       setIsAlert(false);
       set(ref(db, `families/${familyId}/${deviceId}`), {
@@ -313,12 +371,16 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
         aiReason: reason, aiReply: aiReply, userSaid: userSaid
       });
       cooldownTimerRef.current = window.setTimeout(() => {
+          console.log("🔄 ロック解除・監視再開．");
+          isProcessingRef.current = false;
+          setStatusText("🔄 姿勢検知を再始動します...");
           setAiState('idle');
           setUserReply("");
-      }, 180000); 
+      }, 30000); 
   };
 
   const sendAlertForce = (reason: string, aiReply: string, userSaid: string) => {
+      console.log("🚨 緊急通知プロセス完了．");
       setAiState('cooldown'); 
       setIsAlert(true);
       set(ref(db, `families/${familyId}/${deviceId}`), {
@@ -326,23 +388,31 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
         aiReason: reason, aiReply: aiReply, userSaid: userSaid
       });
       cooldownTimerRef.current = window.setTimeout(() => {
+          isProcessingRef.current = false;
           setAiState('idle');
           setIsAlert(false);
           retryCountRef.current = 0;
-      }, 60000); 
+      }, 150000); 
   };
 
   const predict = async () => {
-    if (aiState !== 'idle' || !webcamRef.current || !modelRef.current) return;
+    if (aiState !== 'idle' || isProcessingRef.current || !webcamRef.current || !modelRef.current) return;
+
     const { posenetOutput } = await modelRef.current.estimatePose(webcamRef.current.canvas);
     const prediction = await modelRef.current.predict(posenetOutput);
     const best = prediction.reduce((p, c) => (p.probability > c.probability) ? p : c);
     
     if (best.className === "Fall" && best.probability > 0.9) {
+        console.log("🔥 転倒を検知！ 確信度:", best.probability);
+        isProcessingRef.current = true; // ★即ロック
+
         setAiState('asking');
         setStatusText("🗣️ 声かけ中．．．");
         retryCountRef.current = 0;
-        speak("転倒を検知しました．大丈夫ですか？", () => startListening());
+        speak("転倒を検知しました．大丈夫ですか？", () => {
+            console.log("👂 次のステップ：音声認識");
+            startListening();
+        });
     } else {
         if (lastStateRef.current !== "SAFE") {
              set(ref(db, `families/${familyId}/${deviceId}`), {
@@ -352,6 +422,32 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
         }
     }
   };
+
+  // ★音声制限解除用のスタート画面
+  if (!isStarted) {
+    return (
+      <div style={containerStyle}>
+        <div style={cardStyle}>
+          <h2 style={{color: '#333'}}>監視システムの準備完了</h2>
+          <p style={{color: '#666', marginBottom: '30px', fontSize: '0.9em'}}>
+            ブラウザのセキュリティ制限を解除し，<br/>音声・マイク機能を有効にするために<br/>下のボタンを押してください．
+          </p>
+          <button 
+            onClick={() => {
+                setIsStarted(true);
+                // ボタンを押した瞬間に「無音」を喋らせて権限を確定させる
+                const silentUtterance = new SpeechSynthesisUtterance("");
+                window.speechSynthesis.speak(silentUtterance);
+            }} 
+            style={{...btnStyle, background: '#007bff'}}
+          >
+            監視をスタートする
+          </button>
+          <button onClick={onBack} style={{background: 'none', border: 'none', color: '#999', marginTop: '20px', cursor: 'pointer', textDecoration: 'underline'}}>戻る</button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh', backgroundColor: '#000', overflow: 'hidden' }}>
@@ -371,7 +467,7 @@ const CameraMode = ({ familyId, onBack }: { familyId: string, onBack: () => void
 };
 
 // ==============================================================================
-// 【モニターモード】
+// 【モニターモード】 - 既存のまま
 // ==============================================================================
 const MonitorMode = ({ familyId, onBack }: { familyId: string, onBack: () => void }) => {
   const [cameras, setCameras] = useState<any>({});
@@ -409,7 +505,7 @@ const MonitorMode = ({ familyId, onBack }: { familyId: string, onBack: () => voi
     Object.keys(cameraData).forEach(deviceId => {
         const cam = cameraData[deviceId];
         if (cam.status === "FALL" && email && (now - lastSentTimeRef.current > 60000)) {
-            const logMsg = `🚨 ${deviceId}：転倒検知（AI判断：${cam.aiReason || "不明"}）`;
+            const logMsg = `🚨 ${deviceId}：転倒検知（AI判定：${cam.aiReason || "不明"}）`;
             setLog(prev => [new Date().toLocaleTimeString() + " " + logMsg, ...prev]);
             emailjs.send(SERVICE_ID, TEMPLATE_ID, { user_email: email, reason: cam.aiReason, user_said: cam.userSaid }, PUBLIC_KEY);
             lastSentTimeRef.current = now;
@@ -428,7 +524,6 @@ const MonitorMode = ({ familyId, onBack }: { familyId: string, onBack: () => voi
           <button onClick={onBack} style={{...btnStyle, width: 'auto', padding: '8px 20px', background: '#fff', color: '#555', border: '1px solid #ddd'}}>⬅ 戻る</button>
         </div>
 
-        {/* 【復元】通知先設定セクション */}
         <div style={{ ...monitorCardStyle, marginBottom: '30px', padding: '20px' }}>
           <h3 style={{ marginTop: 0, fontSize: '1.1em', color: '#444' }}>📩 緊急通知先の設定</h3>
           <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
