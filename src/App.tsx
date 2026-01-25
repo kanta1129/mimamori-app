@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import * as tmPose from '@teachablemachine/pose';
 import emailjs from '@emailjs/browser';
 import { initializeApp } from "firebase/app";
